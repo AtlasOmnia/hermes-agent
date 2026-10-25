@@ -174,13 +174,15 @@ def lineage_with_start_times() -> list[tuple[int, float]] | None:
     cannot be computed completely (no psutil, a process that refuses inspection)."""
     try:
         import psutil
+
+        from hermes_cli.process_identity import process_birth
     except ImportError:
         return None
     chain: dict[int, float] = {}
     try:
         proc = psutil.Process()
         while proc is not None and proc.pid not in chain:
-            chain[proc.pid] = proc.create_time()
+            chain[proc.pid] = process_birth(proc)
             proc = proc.parent()
     except (psutil.Error, OSError):
         return None
@@ -192,6 +194,8 @@ def _own_lineage() -> set[int] | None:
     detached pass adds its launcher's ancestors that still run under the same create time (a
     reused pid is not spared), and returns ``None`` (spare every process) without them."""
     import psutil
+
+    from hermes_cli.process_identity import process_birth
 
     if _launcher_lineage is None:
         return None
@@ -205,9 +209,10 @@ def _own_lineage() -> set[int] | None:
         pass
     for pid, started in _launcher_lineage:
         with contextlib.suppress(psutil.Error, OSError):
-            # Tolerance, as for the spawn ledger: Linux create_time adds a whole-second boot time
-            # psutil re-reads per call, which moves when the clock steps (NTP, resume, VM sync).
-            if abs(psutil.Process(pid).create_time() - started) < 2.0:
+            # process_birth: macOS create_time() shifts by a boot-time reference frozen per
+            # process, so the launcher and this pass read different values after a clock step.
+            # Tolerance: Linux create_time adds a whole-second boot time psutil re-reads per call.
+            if abs(process_birth(psutil.Process(pid)) - started) < 2.0:
                 pids.add(pid)
     return pids
 
