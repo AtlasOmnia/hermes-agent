@@ -117,7 +117,11 @@ def test_grace_kill_takes_a_term_ignoring_member_once_the_leader_exits(tmp_path)
     SIGTERM must not outlive it (the leader-only wait used to orphan it)."""
     marker = tmp_path / "member.pid"
     script = tmp_path / "leader.sh"
-    script.write_text(f"#!/usr/bin/env bash\n(trap '' TERM; echo $BASHPID > {marker}; exec sleep 300) &\nsleep 300\n")
+    # A separate `sh -c` (not `$BASHPID`, which macOS's bash 3.2 lacks): `$$` is the member's own
+    # pid, and the ignored TERM disposition survives the exec into sleep.
+    script.write_text("#!/bin/sh\n"
+                      f"sh -c 'trap \"\" TERM; echo $$ > {marker}; exec sleep 300' &\n"
+                      "sleep 300\n")
     script.chmod(0o755)
     proc = subprocess.Popen([str(script)], process_group=0, stdin=subprocess.DEVNULL)
     member = _wait_marker(marker)
