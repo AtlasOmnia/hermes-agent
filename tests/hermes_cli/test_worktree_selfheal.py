@@ -146,7 +146,8 @@ class TestMaintainPackHealth:
     def test_pass_refreshes_a_stale_graph_in_a_treeless_clone_without_fetching(self, tmp_path):
         """A graph that stopped covering HEAD makes every ``git tag --merged HEAD`` walk the gap. In a
         partial clone over a Bloom graph, a write that recomputes changed paths lazy-fetches the tree
-        of every new commit (#127711): the refresh must write the graph and download nothing."""
+        of every new commit (#127711): the refresh must write the graph and download nothing. Run from
+        a linked worktree, whose ``.git`` is a file: the object store is the clone's."""
         import os
         import time
 
@@ -177,11 +178,14 @@ class TestMaintainPackHealth:
         old = time.time() - 3 * 86400
         for graph in (info / "commit-graphs").iterdir():
             os.utime(graph, (old, old))
+        linked = tmp_path / "linked"
+        _git(clone, "worktree", "add", "-q", "--no-checkout", "--detach", str(linked), "HEAD")
         packs = sorted((clone / ".git" / "objects" / "pack").glob("*.pack"))
 
-        worktree_ops._maintain_pack_health(str(clone))
+        worktree_ops._maintain_pack_health(str(linked))
 
         assert (info / "commit-graphs" / "commit-graph-chain").stat().st_mtime > time.time() - 300
+        assert (clone / ".git" / "hermes-commit-graph.fresh").is_file()
         assert sorted((clone / ".git" / "objects" / "pack").glob("*.pack")) == packs, "the write lazy-fetched"
         _git(clone, "commit-graph", "verify")
 

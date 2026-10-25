@@ -103,21 +103,28 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
     return removed
 
 
-def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None,
-                          names: Iterable[str] = (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES)) -> list[str]:
-    """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
-
-    Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
-    stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
-    ``names`` narrows the sweep (relative to ``.git``) for repos Hermes does not own.
-    """
-    git_dir = Path(repo_root) / ".git"
+def _sweep_locks(git_dir: Path, names: Iterable[str], min_age_seconds: Optional[int]) -> list[str]:
     return _sweep_stale(
         git_dir, lambda: [git_dir / name for name in names],
         min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
     )
+
+
+def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
+    """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
+
+    Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
+    stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
+    """
+    return _sweep_locks(Path(repo_root) / ".git", (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES), min_age_seconds)
+
+
+def clear_stale_object_store_locks(git_dir: Path) -> list[str]:
+    """``OBJECT_STORE_LOCK_NAMES`` only, under ``git_dir`` itself (a linked worktree's or submodule's
+    common dir), for repos Hermes does not own: index.lock / HEAD.lock there are the user's git's."""
+    return _sweep_locks(Path(git_dir), OBJECT_STORE_LOCK_NAMES, None)
 
 
 def release_dead_index_lock(repo_root: Path) -> bool:

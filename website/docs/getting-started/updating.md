@@ -318,8 +318,10 @@ whole history: each `hermes update` (after the new code is in place) and each `h
 update a missing or day-old graph in the background, at most once every 6 hours, with
 `git commit-graph write --reachable --split --no-changed-paths`, which reads commits only and never
 downloads a tree. The update does not wait for it, and a write still running after 10 minutes is
-stopped (asked to exit first, so git removes its own lock). A failed write is logged to
-`logs/agent.log`. A repo with `core.commitGraph=false` is left without a graph. A
+stopped (asked to exit first, so git removes its own lock). A failed or stopped write is logged to
+`logs/agent.log`. A checkout that is a linked worktree or submodule refreshes the graph of the
+repository it shares objects with. A repo with `core.commitGraph=false` in its own, your global or
+the system git config is left without a graph. A
 `commit-graph.lock` or `multi-pack-index.lock` that a killed git left behind is removed by the same
 stale-lock sweep as `index.lock` once it is 10 minutes old and no git is running; in a repo you
 launch `hermes -w` from, only those object-store locks are swept, never `index.lock` or `HEAD.lock`.

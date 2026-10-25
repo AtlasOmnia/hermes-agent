@@ -103,7 +103,7 @@ def test_graph_refresh_clears_object_store_debris_and_leaves_the_index_lock(repo
     for path in (*debris, git_dir / "index.lock"):
         path.parent.mkdir(parents=True, exist_ok=True)
         _touch(path, STALE_LOCK_MIN_AGE_SECONDS + 60)
-    refresh_commit_graph(str(repo))
+    refresh_commit_graph(str(repo), git_dir)
     assert [path for path in debris if path.exists()] == []
     assert (git_dir / "index.lock").exists()
     subprocess.run(["git", "commit-graph", "verify"], cwd=repo, check=True)

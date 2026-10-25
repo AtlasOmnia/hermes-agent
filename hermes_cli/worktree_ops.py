@@ -22,6 +22,7 @@ from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.git_commit_graph import (
     claim_commit_graph_refresh,
     claim_maintenance_slot,
+    common_git_dir,
     refresh_commit_graph,
     run_bounded_git,
 )
@@ -147,21 +148,22 @@ def _maintain_pack_health(repo_root: str) -> None:
     pack index and worktree creation can blow its timeout under concurrent load.
     """
     try:
-        pack_dir = Path(repo_root) / ".git" / "objects" / "pack"
-        if not pack_dir.is_dir():
+        # A linked worktree's or submodule's ``.git`` is a file; its objects live in the common dir.
+        git_dir = common_git_dir(repo_root)
+        pack_dir = git_dir / "objects" / "pack" if git_dir else None
+        if pack_dir is None or not pack_dir.is_dir():
             return
-        git_dir = pack_dir.parent.parent
         packs = len(list(pack_dir.glob("*.pack")))
         if packs >= _PACK_SPRAWL_THRESHOLD and _claim_repack_slot(git_dir):
             from hermes_cli.gitlock import clear_stale_tmp_packs
-            clear_stale_tmp_packs(Path(repo_root))
+            clear_stale_tmp_packs(git_dir)
             logger.info("git pack sprawl (%d packs) — repacking in background", packs)
             _run_bounded_repack(repo_root)
             # Repacking can strand now-duplicated admin files; prune on the same pass.
             _git(["worktree", "prune"], repo_root, timeout=60, check=False,
                  stdin=subprocess.DEVNULL, env=noninteractive_git_env())
         if claim_commit_graph_refresh(git_dir):
-            refresh_commit_graph(repo_root)
+            refresh_commit_graph(repo_root, git_dir)
     except Exception as e:
         logger.debug("pack maintenance skipped: %s", e)
 

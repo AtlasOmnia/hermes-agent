@@ -112,6 +112,28 @@ def test_group_kill_skipped_when_child_shares_our_group():
     assert proc.returncode is not None
 
 
+def test_grace_kill_takes_a_term_ignoring_member_once_the_leader_exits(tmp_path):
+    """``grace`` returns as soon as the leader exits on SIGTERM; a group member that ignores
+    SIGTERM must not outlive it (the leader-only wait used to orphan it)."""
+    marker = tmp_path / "member.pid"
+    script = tmp_path / "leader.sh"
+    script.write_text(f"#!/usr/bin/env bash\n(trap '' TERM; echo $BASHPID > {marker}; exec sleep 300) &\nsleep 300\n")
+    script.chmod(0o755)
+    proc = subprocess.Popen([str(script)], process_group=0, stdin=subprocess.DEVNULL)
+    member = _wait_marker(marker)
+
+    kill_process_tree(proc, grace=5.0)
+
+    assert proc.returncode is not None
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and _pid_alive(member):
+        time.sleep(0.05)
+    alive = _pid_alive(member)
+    if alive:  # reparented out of our subtree, so the live-system guard refuses os.kill here
+        subprocess.run(["kill", "-9", str(member)], check=False)
+    assert not alive, f"SIGTERM-ignoring member {member} survived the graced kill"
+
+
 def test_fast_path_unaffected(tmp_path):
     """Successful probes behave exactly as before the group-kill port."""
     subprocess.run(["git", "init", "-q", str(tmp_path / "repo")], check=True)

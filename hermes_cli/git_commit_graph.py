@@ -20,8 +20,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 from hermes_cli._subprocess_compat import (
     IS_WINDOWS,
@@ -50,34 +51,60 @@ _CHILD = ("import sys; sys.path.insert(0, sys.argv[1]); "
           "from hermes_cli.git_commit_graph import refresh_in_child; refresh_in_child(*sys.argv[2:])")
 
 
+@contextmanager
+def _locked_slot(lock: Path, *, wait: bool) -> Iterator[Optional[int]]:
+    """The slot file's fd under an exclusive cross-process lock, or None while another process holds
+    it (``wait=False``). The file is never unlinked: a waiter on a deleted inode would claim a slot
+    nobody else can see. The kernel drops the lock with the process."""
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            if IS_WINDOWS:
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except OSError:
+            yield None
+            return
+        try:
+            yield fd
+        finally:
+            if IS_WINDOWS:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
 def claim_maintenance_slot(git_dir: Path, lock_name: str, interval: float) -> bool:
     """Exactly one process per clone gets to run a maintenance job per ``interval``.
 
-    The lock file's mtime is the stamp: younger than the interval means another launch is
-    running the job (or just tried and timed out) — skip. A stale lock is taken over by ``replace``,
-    which only one of N racing processes can win; the O_EXCL create then serializes against a
-    process that found no lock at all.
+    The slot file holds the claimant's pid and its mtime is the stamp: younger than the interval
+    means another launch is running the job (or just tried and timed out) — skip. Check and claim
+    happen under one file lock, so of N launches finding an expired or empty slot exactly one wins.
     """
-    lock = git_dir / lock_name
-    try:
-        st = lock.stat()
-    except FileNotFoundError:
-        pass
-    else:
-        if time.time() - st.st_mtime < interval:
+    with _locked_slot(git_dir / lock_name, wait=False) as fd:
+        if fd is None:
             return False
-        try:
-            lock.replace(lock.with_suffix(".stale"))
-        except OSError:
+        st = os.fstat(fd)
+        if st.st_size and time.time() - st.st_mtime < interval:
             return False
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return False
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(f"{os.getpid()}\n")
-    lock.with_suffix(".stale").unlink(missing_ok=True)
-    return True
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        return True
+
+
+def release_maintenance_slot(git_dir: Path, lock_name: str) -> None:
+    """Give back this process's claim (its job never started) so the next run retries; a claim
+    another process made since is left alone."""
+    with _locked_slot(git_dir / lock_name, wait=True) as fd:
+        if fd is not None and os.read(fd, 32).strip() == str(os.getpid()).encode():
+            os.ftruncate(fd, 0)
 
 
 def run_bounded_git(repo_root: str, args: Sequence[str], timeout: float, env: Optional[dict] = None) -> Optional[int]:
@@ -108,7 +135,7 @@ def run_bounded_git(repo_root: str, args: Sequence[str], timeout: float, env: Op
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _reap()
-            logger.info("git %s exceeded %ds; killed", args[0], timeout)
+            logger.warning("git %s in %s exceeded %ss; killed", args[0], repo_root, timeout)
             return None
         finally:
             atexit.unregister(_reap)
@@ -138,41 +165,74 @@ def claim_commit_graph_refresh(git_dir: Path) -> bool:
 
 
 def _commit_graph_disabled(repo_root: str) -> bool:
-    """``core.commitGraph=false``: the owner turned graphs off in this repo; never write one there."""
+    """``core.commitGraph=false`` in the repo, global or system config: never write a graph there.
+
+    Read with the user's global/system config, which the writer's isolated env blanks."""
+    env = noninteractive_git_env()
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+        env.pop(key)
+        if key in os.environ:
+            env[key] = os.environ[key]
     probe = bounded_probe_run(["git", "config", "--type=bool", "--get", "core.commitGraph"],
-                              timeout=10, cwd=repo_root, env=noninteractive_git_env())
+                              timeout=10, cwd=repo_root, env=env)
     return probe is not None and probe.stdout.strip() == "false"
 
 
-def refresh_commit_graph(repo_root: str) -> None:
-    """Clear what a killed writer stranded, then write the graph (bounded, niced, never lazy-fetching)."""
-    from hermes_cli.gitlock import OBJECT_STORE_LOCK_NAMES, clear_stale_git_locks, clear_stale_tmp_packs
+def common_git_dir(repo_root: str | Path) -> Optional[Path]:
+    """The git dir holding the object store: ``.git`` itself, or the dir a linked worktree's or
+    submodule's ``.git`` file leads to. None when ``repo_root`` is no checkout."""
+    from hermes_cli.update_lock import _git_common_dir
+
+    return _git_common_dir(Path(repo_root))
+
+
+def refresh_commit_graph(repo_root: str, git_dir: Path) -> None:
+    """Clear what a killed writer stranded, then write the graph (bounded, niced, never lazy-fetching).
+
+    ``git_dir`` is the common git dir (:func:`common_git_dir`): objects, debris and stamp live there."""
+    from hermes_cli.gitlock import clear_stale_object_store_locks, clear_stale_tmp_packs
 
     if _commit_graph_disabled(repo_root):
         logger.info("core.commitGraph=false in %s; not writing a commit-graph", repo_root)
         return
-    root = Path(repo_root)
     # Object-store debris only: ``hermes -w`` runs this in whatever repo it was launched from, where
     # index.lock / HEAD.lock belong to the user's own git (and pgrep can be blind to it).
-    clear_stale_git_locks(root, names=OBJECT_STORE_LOCK_NAMES)
-    clear_stale_tmp_packs(root)
+    clear_stale_object_store_locks(git_dir)
+    clear_stale_tmp_packs(git_dir)
     logger.info("git commit-graph missing or stale — writing it in background")
     if run_bounded_git(repo_root, _WRITE, _TIMEOUT, env={**noninteractive_git_env(), **NO_LAZY_FETCH_ENV}) == 0:
-        (root / ".git" / _FRESH_STAMP).touch()
+        (git_dir / _FRESH_STAMP).touch()
 
 
-def refresh_in_child(repo_root: str, log_file: str) -> None:
+class _LogDirOnFailureHandler(logging.FileHandler):
+    """Opens (``delay``) only when there is a failure to record, creating ``logs/`` then: a home
+    whose logs were never set up still gets the line; a deleted profile is not resurrected. A log
+    that cannot be opened drops the line (``handleError``) instead of raising out of the logger."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.stream is None:
+            from hermes_constants import mkdir_under_hermes_home
+
+            try:
+                mkdir_under_hermes_home(Path(self.baseFilename).parent)
+                self.stream = self._open()
+            except OSError:  # a missing/deleted named profile is FileNotFoundError
+                self.handleError(record)
+                return
+        super().emit(record)
+
+
+def refresh_in_child(repo_root: str, git_dir: str, log_file: str) -> None:
     """Body of the detached child: a failure is appended to the home's agent.log; never raises.
 
     A plain handler, not ``setup_logging``: that reads config.yaml and seeds the home's layout,
     side effects a git maintenance child has no business having in a profile mid-update.
-    ``delay`` opens the log only when there is a failure to record.
     """
-    handler = logging.FileHandler(log_file, encoding="utf-8", delay=True)
+    handler = _LogDirOnFailureHandler(log_file, encoding="utf-8", delay=True)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)
     try:
-        refresh_commit_graph(repo_root)
+        refresh_commit_graph(repo_root, Path(git_dir))
     except Exception:
         logger.warning("Background commit-graph refresh of %s failed", repo_root, exc_info=True)
 
@@ -187,11 +247,12 @@ def spawn_commit_graph_refresh(repo_root: Path) -> bool:
     """
     from hermes_constants import get_hermes_home
 
-    git_dir = Path(repo_root) / ".git"
-    if not (git_dir / "objects").is_dir() or not claim_commit_graph_refresh(git_dir):
+    git_dir = common_git_dir(repo_root)
+    if git_dir is None or not (git_dir / "objects").is_dir() or not claim_commit_graph_refresh(git_dir):
         return False
     code_root = Path(__file__).resolve().parents[1]
-    argv = [sys.executable, "-c", _CHILD, str(code_root), str(repo_root), str(get_hermes_home() / "logs" / "agent.log")]
+    argv = [sys.executable, "-c", _CHILD, str(code_root), str(repo_root), str(git_dir),
+            str(get_hermes_home() / "logs" / "agent.log")]
     kwargs: dict = dict(cwd=str(repo_root), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL, close_fds=True)
     try:
@@ -203,6 +264,6 @@ def spawn_commit_graph_refresh(repo_root: Path) -> bool:
             # A job object without BREAKAWAY_OK refuses CREATE_BREAKAWAY_FROM_JOB; retry without it.
             subprocess.Popen(argv, **kwargs, creationflags=windows_detach_flags_without_breakaway())
     except OSError:
-        (git_dir / _LOCK).unlink(missing_ok=True)
+        release_maintenance_slot(git_dir, _LOCK)
         raise
     return True
