@@ -47,6 +47,8 @@ OBJECT_STORE_LOCK_NAMES = (
 # success; anything left with these names after a fetch died is garbage by definition.
 # ``.tmp-<pid>-pack*`` is the same thing from ``pack-objects`` (repack/gc) killed mid-write.
 _TMP_PACK_PREFIXES = ("tmp_pack_", "tmp_idx_", "tmp_rev_", "tmp_mtimes_", ".tmp-")
+# A split commit-graph write killed before its rename strands this in objects/info/commit-graphs.
+_TMP_GRAPH_PREFIX = "tmp_graph_"
 
 
 def _git_proc_running() -> bool:
@@ -101,15 +103,17 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
     return removed
 
 
-def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
+def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None,
+                          names: Iterable[str] = (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES)) -> list[str]:
     """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
 
     Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
     stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
+    ``names`` narrows the sweep (relative to ``.git``) for repos Hermes does not own.
     """
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(
-        git_dir, lambda: [git_dir / name for name in (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES)],
+        git_dir, lambda: [git_dir / name for name in names],
         min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
@@ -343,23 +347,28 @@ def _migrate_earlier_maintenance_keys(repo_root: Path) -> None:
 
 
 def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
-    """Remove aborted-transfer temp pack files; same contract as clear_stale_git_locks.
+    """Remove aborted-transfer temp pack files and killed commit-graph writes' ``tmp_graph_*``;
+    same contract as clear_stale_git_locks.
 
     Resolves ``.git/objects/pack`` for a checkout and ``objects/pack`` for a bare repo such as
     the checkpoint store — a ``git gc`` killed by a timeout strands the same debris there."""
     pack_dir = _pack_dir(repo_root)
+    graph_dir = pack_dir.parent / "info" / "commit-graphs"
 
     def _candidates():
-        try:
-            return [e for e in pack_dir.iterdir() if e.name.startswith(_TMP_PACK_PREFIXES)]
-        except OSError:
-            return []
+        found = []
+        for directory, prefixes in ((pack_dir, _TMP_PACK_PREFIXES), (graph_dir, _TMP_GRAPH_PREFIX)):
+            try:
+                found += [e for e in directory.iterdir() if e.name.startswith(prefixes)]
+            except OSError:
+                pass
+        return found
 
     return _sweep_stale(
         pack_dir, _candidates,
         min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping tmp-pack sweep",
-        log_removed=lambda p, size: logger.info("Removed aborted-fetch pack debris %s (%d bytes)", p, size),
+        log_removed=lambda p, size: logger.info("Removed aborted-write git debris %s (%d bytes)", p, size),
     )
 
 

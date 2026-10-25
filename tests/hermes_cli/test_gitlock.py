@@ -91,17 +91,24 @@ def test_clear_removes_all_stale_lock_kinds(repo: Path, no_git_running: None) ->
         assert not (repo / ".git" / name).exists()
 
 
-def test_clear_removes_stale_commit_graph_and_midx_locks(repo: Path, no_git_running: None) -> None:
-    """A killed graph/midx writer's lock fails every later write of that file (git: "File exists")."""
-    locks = [repo / ".git" / "objects" / rel for rel in (
-        "info/commit-graph.lock", "info/commit-graphs/commit-graph-chain.lock",
+def test_graph_refresh_clears_object_store_debris_and_leaves_the_index_lock(repo: Path, no_git_running: None) -> None:
+    """A killed graph/midx writer's lock fails every later write of that file (git: "File exists"). The
+    refresh also runs in whatever repo ``hermes -w`` started in, where index.lock is the user's git's."""
+    from hermes_cli.git_commit_graph import refresh_commit_graph
+
+    git_dir = repo / ".git"
+    debris = [git_dir / "objects" / rel for rel in (
+        "info/commit-graph.lock", "info/commit-graphs/commit-graph-chain.lock", "info/commit-graphs/tmp_graph_x1",
         "pack/multi-pack-index.lock", "pack/multi-pack-index.d/multi-pack-index-chain.lock")]
-    for lock in locks:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        _touch(lock, STALE_LOCK_MIN_AGE_SECONDS + 60)
-    clear_stale_git_locks(repo)
-    assert [lock for lock in locks if lock.exists()] == []
-    subprocess.run(["git", "commit-graph", "write", "--reachable", "--split", "--no-progress"], cwd=repo, check=True)
+    for path in (*debris, git_dir / "index.lock"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _touch(path, STALE_LOCK_MIN_AGE_SECONDS + 60)
+    refresh_commit_graph(str(repo))
+    assert [path for path in debris if path.exists()] == []
+    assert (git_dir / "index.lock").exists()
+    subprocess.run(["git", "commit-graph", "verify"], cwd=repo, check=True)
+    # The install checkout's own sweep (every update) still takes it.
+    assert clear_stale_git_locks(repo) == [str(git_dir / "index.lock")]
 
 
 def test_clear_skips_sweep_while_git_running(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:

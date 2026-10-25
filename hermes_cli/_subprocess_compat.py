@@ -735,8 +735,11 @@ def pid_is_hermes(pid: int, *, expected_start_time: int | None = None) -> bool:
         return False
 
 
-def kill_process_tree(proc: subprocess.Popen) -> None:
+def kill_process_tree(proc: subprocess.Popen, *, grace: float = 0.0) -> None:
     """Best-effort terminate *proc* and its descendants on both platforms; never raises.
+
+    ``grace`` > 0 (POSIX): SIGTERM the tree first and SIGKILL only if *proc* outlives ``grace``
+    seconds, so a git can delete its lock and tmp files on the way out (Windows always forces).
 
     ``proc.kill()`` alone only terminates the direct child. This is cleanup on an already-failing
     path whose contract is to fail open, so every failure (access denied, already reaped) is
@@ -756,6 +759,15 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
     try:
         from agent.deadline import kill_process_tree as _deadline_kill_tree
 
+        if grace > 0 and not IS_WINDOWS:
+            import signal as _signal
+
+            _deadline_kill_tree(proc.pid, sig=_signal.SIGTERM)
+            try:
+                proc.wait(timeout=grace)
+                return
+            except subprocess.TimeoutExpired:
+                pass
         _deadline_kill_tree(proc.pid)
     except Exception:
         _legacy_kill_process_tree(proc)

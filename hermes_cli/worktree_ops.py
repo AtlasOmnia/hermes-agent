@@ -4,7 +4,6 @@ Every git call goes through ``_git``/``_git_out``/``_git_quiet`` (UTF-8 text, ca
 bounded timeout). Classification helpers fail SAFE toward "preserve". ``cli`` re-exports
 these names; ``_cprint`` is imported lazily from ``cli`` to avoid a cycle.
 """
-import atexit
 import concurrent.futures
 import json
 import logging
@@ -19,7 +18,13 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
-from hermes_cli._subprocess_compat import NO_LAZY_FETCH_ENV, kill_process_tree, noninteractive_git_env
+from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.git_commit_graph import (
+    claim_commit_graph_refresh,
+    claim_maintenance_slot,
+    refresh_commit_graph,
+    run_bounded_git,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -123,124 +128,16 @@ _REPACK_TIMEOUT = 1800
 # concurrent multi-GB repacks (each too slow under the others to ever finish inside the timeout).
 _REPACK_MIN_INTERVAL = 6 * 3600
 _REPACK_LOCK = "hermes-repack.lock"
-# Generation numbers in the commit-graph keep ``git tag --merged HEAD`` (the version lookup) and
-# ancestry checks off a full history walk: on hermes-agent a graph two months behind cost 0.33 s
-# per lookup, a fresh one 0.04 s. Partial clones have git's own graph writers switched off
-# (gitlock._TREE0_MAINTENANCE_OFF, #127711), so nothing else refreshes it there. Without Bloom data
-# the write reads commits only, never trees, so it cannot start that lazy-fetch loop, and it costs
-# ~3 s instead of ~27 s when changed paths would be recomputed.
-_COMMIT_GRAPH_WRITE = ("commit-graph", "write", "--reachable", "--split", "--no-changed-paths", "--no-progress")
-_COMMIT_GRAPH_MAX_AGE = 24 * 3600
-_COMMIT_GRAPH_TIMEOUT = 600
-_COMMIT_GRAPH_LOCK = "hermes-commit-graph.lock"
 
 
-def _claim_repack_slot(git_dir: Path, lock_name: str = _REPACK_LOCK) -> bool:
-    """Exactly one process per clone gets to run a maintenance job per ``_REPACK_MIN_INTERVAL``.
-
-    The lock file's mtime is the stamp: younger than the interval means another launch is
-    running the job (or just tried and timed out) — skip. A stale lock is taken over by ``replace``,
-    which only one of N racing processes can win; the O_EXCL create then serializes against a
-    process that found no lock at all.
-    """
-    lock = git_dir / lock_name
-    try:
-        st = lock.stat()
-    except FileNotFoundError:
-        pass
-    else:
-        if time.time() - st.st_mtime < _REPACK_MIN_INTERVAL:
-            return False
-        try:
-            lock.replace(lock.with_suffix(".stale"))
-        except OSError:
-            return False
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return False
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(f"{os.getpid()}\n")
-    lock.with_suffix(".stale").unlink(missing_ok=True)
-    return True
+def _claim_repack_slot(git_dir: Path) -> bool:
+    """Exactly one process per clone gets to repack per ``_REPACK_MIN_INTERVAL``."""
+    return claim_maintenance_slot(git_dir, _REPACK_LOCK, _REPACK_MIN_INTERVAL)
 
 
 def _run_bounded_repack(repo_root: str) -> None:
     """Incremental geometric repack whose whole process tree dies with the timeout or with us."""
-    _run_bounded_git(repo_root, ["repack", "-d", "--geometric=2", "--write-midx", "--quiet"], _REPACK_TIMEOUT)
-
-
-def _run_bounded_git(repo_root: str, args, timeout: float, env: Optional[dict] = None) -> None:
-    """Run a niced ``git *args`` whose whole process tree dies with the timeout or with us.
-
-    ``repack`` forks ``pack-objects``; ``subprocess.run(timeout=)`` killed only the parent and
-    left the grandchild packing for days, and a daemon thread's child outlived the CLI the same
-    way. A new session/process group + ``atexit`` reaps both cases.
-    """
-    cmd = ["git", *args]
-    if os.name == "posix":
-        cmd = ["nice", "-n", "19", *cmd]
-        group_kw: dict = {"process_group": 0}
-    else:
-        group_kw = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-    proc = subprocess.Popen(cmd, cwd=repo_root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, env=env, **group_kw)
-
-    def _reap() -> None:
-        if proc.poll() is None:
-            kill_process_tree(proc)
-
-    atexit.register(_reap)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _reap()
-        logger.info("git %s exceeded %ds; killed (next attempt in %dh)", args[0], timeout, _REPACK_MIN_INTERVAL // 3600)
-
-
-def _commit_graph_stale(git_dir: Path) -> bool:
-    """No commit-graph, or none written for a day (a write with no new commits leaves it untouched)."""
-    info = git_dir / "objects" / "info"
-    stamps = [p.stat().st_mtime for p in (info / "commit-graph", info / "commit-graphs" / "commit-graph-chain")
-              if p.is_file()]
-    return not stamps or time.time() - max(stamps) > _COMMIT_GRAPH_MAX_AGE
-
-
-def _refresh_commit_graph(repo_root: str) -> None:
-    from hermes_cli.gitlock import clear_stale_git_locks
-
-    # A writer killed mid-write strands commit-graph-chain.lock and every later write fails on it.
-    clear_stale_git_locks(Path(repo_root))
-    logger.info("git commit-graph missing or stale — writing it in background")
-    _run_bounded_git(repo_root, _COMMIT_GRAPH_WRITE, _COMMIT_GRAPH_TIMEOUT,
-                     env={**noninteractive_git_env(), **NO_LAZY_FETCH_ENV})
-
-
-def _claim_commit_graph_refresh(git_dir: Path) -> bool:
-    return _commit_graph_stale(git_dir) and _claim_repack_slot(git_dir, _COMMIT_GRAPH_LOCK)
-
-
-_REFRESH_CHILD = ("import sys; sys.path.insert(0, sys.argv[1]); "
-                  "from hermes_cli.worktree_ops import _refresh_commit_graph; _refresh_commit_graph(sys.argv[1])")
-
-
-def spawn_commit_graph_refresh(repo_root: Path) -> bool:
-    """Start the bounded commit-graph refresh in a detached child when it is due; never waits.
-
-    ``hermes update`` is the one regular git pass an install checkout gets (``hermes -w`` is
-    rarely launched from it), so without this its version lookups never get a graph. Detached
-    because the write takes seconds and must neither delay the update nor die with it; the child
-    is the same runner the ``-w`` pass uses (niced, process tree killed at the timeout).
-    """
-    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
-
-    git_dir = Path(repo_root) / ".git"
-    if not (git_dir / "objects").is_dir() or not _claim_commit_graph_refresh(git_dir):
-        return False
-    subprocess.Popen([sys.executable, "-c", _REFRESH_CHILD, str(repo_root)], cwd=str(repo_root),
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     close_fds=True, **windows_detach_popen_kwargs())
-    return True
+    run_bounded_git(repo_root, ["repack", "-d", "--geometric=2", "--write-midx", "--quiet"], _REPACK_TIMEOUT)
 
 
 def _maintain_pack_health(repo_root: str) -> None:
@@ -263,8 +160,8 @@ def _maintain_pack_health(repo_root: str) -> None:
             # Repacking can strand now-duplicated admin files; prune on the same pass.
             _git(["worktree", "prune"], repo_root, timeout=60, check=False,
                  stdin=subprocess.DEVNULL, env=noninteractive_git_env())
-        if _claim_commit_graph_refresh(git_dir):
-            _refresh_commit_graph(repo_root)
+        if claim_commit_graph_refresh(git_dir):
+            refresh_commit_graph(repo_root)
     except Exception as e:
         logger.debug("pack maintenance skipped: %s", e)
 
