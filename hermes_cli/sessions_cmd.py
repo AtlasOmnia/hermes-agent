@@ -984,7 +984,7 @@ def _optimize_progress_line(info) -> str:
     phase, pct = info.get("phase"), f"{info.get('percent', 0):3d}%"
     counts = f"({info.get('indexed', 0):,}/{info.get('total', 0):,}"
     if phase == "backfill":
-        return f"  Rebuilding index: {pct} {counts} messages)"
+        return f"  Rebuilding index: {pct} {counts})"
     if phase == "teardown":
         table = str(info.get("table", "")).removeprefix("fts_v22_trash_")
         return (f"  Reclaiming old index: table {info.get('table_index', 0)}/{info.get('table_count', 0)} "

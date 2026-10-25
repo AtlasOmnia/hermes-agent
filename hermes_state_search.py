@@ -486,11 +486,14 @@ class SessionSearchMixin:
         # Only INTEGER-pk tables (rowid aliases) carry a resume marker; count what is left past it.
         marker = _meta_row(conn, f"fts_teardown_{tbl}_progress")
         where, params = ("WHERE rowid > ?", (int(marker[0]),)) if marker is not None else ("", ())
-        progress.table_count = progress.table_count or len(trash)
-        progress.table, progress.table_index = tbl, max(1, progress.table_count - len(trash) + 1)
-        progress.total = int(conn.execute(f"SELECT COUNT(*) FROM {tbl} {where}", params).fetchone()[0])
-        progress.drained = 0
+        table_count = progress.table_count or len(trash)
+        # COUNT before publishing the table: a failed COUNT must leave progress on the previous
+        # table so the retry runs this start step again instead of inheriting its totals.
+        total = int(conn.execute(f"SELECT COUNT(*) FROM {tbl} {where}", params).fetchone()[0])
+        progress.table_count, progress.total, progress.drained = table_count, total, 0
+        progress.table_index = max(1, table_count - len(trash) + 1)
         self._fts_chunk_rows = self._FTS_REBUILD_CHUNK_ROWS
+        progress.table = tbl
 
     def _fts_cjk_reset_if_stale(self) -> None:
         """From-scratch rebuild of a stale cjk index (triggers were dropped, gap extent unknown):
