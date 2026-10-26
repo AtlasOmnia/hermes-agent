@@ -1326,9 +1326,10 @@ def update_in_progress(install_root: Path | str | None = None) -> bool:
 def checkout_lock_held(install_root: Path | str | None = None) -> bool:
     """True while some process (this one included) holds the checkout kernel lock.
 
-    A probe takes the lock for the microseconds of one try and drops it (closing the fd), the
-    way ``marker.sh::checkout_lock_held`` does; an updater acquiring at that instant waits
-    :data:`CHECKOUT_CONTENTION_WAIT_SECONDS` instead of failing (R6/D17).
+    A probe takes the lock briefly and drops it (closing the fd). Require contention across
+    three attempts over 100 ms before declaring it held: another reader (including an older
+    launcher using an exclusive probe) is not an updater. Writers retain their longer
+    :data:`CHECKOUT_CONTENTION_WAIT_SECONDS` budget (R6/D17).
 
     Only a missing lock file is free. One that exists but cannot be opened answers held, the same
     verdict ``marker.sh`` / ``marker.ps1`` and the Desktop probes give, so no reader admits a
@@ -1345,10 +1346,13 @@ def checkout_lock_held(install_root: Path | str | None = None) -> bool:
     except OSError:
         return True
     try:
-        if not _try_lock(fd):
-            return True
-        _unlock(fd)
-        return False
+        for attempt in range(3):
+            if attempt:
+                time.sleep(0.05)
+            if _try_lock(fd):
+                _unlock(fd)
+                return False
+        return True
     except OSError:
         return False
     finally:
