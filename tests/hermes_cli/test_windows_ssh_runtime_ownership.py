@@ -12,7 +12,7 @@ import pytest
 from hermes_cli.windows_ssh_runtime import process_state
 
 
-@pytest.mark.platforms("posix")
+@pytest.mark.platforms("posix", "windows")
 def test_isolated_bootstrap_is_owned_without_accepting_foreign_source(tmp_path):
     package = tmp_path / "hermes_cli"
     package.mkdir()
